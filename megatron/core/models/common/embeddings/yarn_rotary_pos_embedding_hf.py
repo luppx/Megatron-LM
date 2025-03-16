@@ -22,22 +22,26 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
     Args:
         kv_channels (int): Projection weights dimension in multi-head attention. Obtained from
             transformer config. This is set to hidden_size // num_attention_heads if not provided.
+        rope_theta (int, optional): Base period for rotary position embeddings. Defaults to
+            10000.
+        max_position_embeddings (int, optional): Max position embeddings used during pre-training. Defaults to 4096.
+        factor (float, optional): The scaling factor to apply to the RoPE embeddings. In
+            most scaling types, a `factor` of x will enable the model to handle sequences of length x *
+            original maximum pre-trained length. Defaults to 1.0.
+        attention_factor (float, optional): The scaling factor to be applied on the attention
+            computation. If unspecified, it defaults to value recommended by the implementation, using the
+            `factor` field to infer the suggested value.
+        beta_fast (float, optional): Parameter to set the boundary for extrapolation (only) in the linear
+            ramp function. Defaults to 32.
+        beta_slow (float, optional): Parameter to set the boundary for interpolation (only) in the linear
+            ramp function. Defaults to 1.
         rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings.
         rotary_interleaved (bool, optional): If True, interleaved rotary position embeddings.
             Defaults to False.
         seq_len_interpolation_factor (float, optional): scale of linearly interpolating RoPE for
             longer sequences. The value must be a float larger than 1.0. Defaults to None
-        rotary_base (float, optional): Base period for rotary position embeddings. Defaults to
-            10000.
         use_cpu_initialization (bool, optional): If False, initialize the inv_freq directly on
             the GPU. Defaults to False
-        scaling_factor (float, optional): Scaling factor for Yarn RoPE. Defaults to 1.0.
-        original_max_position_embeddings (int, optional): Original maximum position embeddings
-            length. Defaults to 4096.
-        beta_fast (float, optional): Fast beta value for Yarn RoPE. Defaults to 32.
-        beta_slow (float, optional): Slow beta value for Yarn RoPE. Defaults to 1.
-        mscale (float, optional): Mscale value for Yarn RoPE. Defaults to 1.
-        mscale_all_dim (float, optional): Mscale all dim value for Yarn RoPE. Defaults to 0.
     """
 
     def __init__(
@@ -62,7 +66,7 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
         self.factor = factor
         # Sets the attention factor as suggested in the paper
         if attention_factor is None:
-            self.attention_factor = 0.1 * math.log(factor) + 1.0
+            self.attention_factor = _get_mscale(factor)
 
         # Optional config options
         # beta_fast/beta_slow: as suggested in the paper, default to 32/1 (correspondingly)
@@ -76,14 +80,6 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
         self.inv_freq_extrapolation = 1.0 / pos_freqs
         self.inv_freq_interpolation = 1.0 / (self.factor * pos_freqs)
 
-        self.low, self.high = _find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, self.max_position_embeddings)
-
-        # Get n-dimensional rotational scaling corrected for extrapolation
-        self.inv_freq_extrapolation_factor = 1 - _linear_ramp_factor(self.low, self.high, self.dim // 2).float().to(device)
-        self.inv_freq = (
-            self.inv_freq_interpolation * (1 - self.inv_freq_extrapolation_factor)
-            + self.inv_freq_extrapolation * self.inv_freq_extrapolation_factor
-        )
         self.original_inv_freq = self.inv_freq
         self.attention_scaling = self.attention_factor
 
@@ -97,7 +93,7 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
         )
 
     @lru_cache(maxsize=32)
-    def forward(self, x, position_ids) -> Tensor:
+    def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
@@ -115,14 +111,40 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
             # move `inv_freq_interpolation` to GPU once at the first micro-batch forward pass
             self.inv_freq_interpolation = self.inv_freq_interpolation.to(device=torch.cuda.current_device())
 
-        self.inv_freq = self.inv_freq.to(device=torch.cuda.current_device())
+        low, high = _find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, 
+            self.max_position_embeddings)
 
-        # Core RoPE block
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        position_ids_expanded = position_ids[:, None, :].float()
-        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
-        device_type = x.device.type
-        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        # Get n-dimensional rotational scaling corrected for extrapolation
+        inv_freq_extrapolation_factor = 1 - _linear_ramp_factor(low, high, self.dim // 2).to(
+            device=self.inv_freq_extra.device, dtype=torch.float32
+        )
+        inv_freq = (
+            self.inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
+            + self.inv_freq_extrapolation * inv_freq_extrapolation_factor
+        )
+
+        seq = (
+            torch.arange(
+                max_seq_len, device=self.inv_freq_extra.device, dtype=self.inv_freq_extra.dtype
+            )
+            + offset
+        )
+
+        freqs = torch.outer(seq, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        emb = emb[:, None, None, :]
+        if parallel_state.get_context_parallel_world_size() > 1:
+            # slice rotary_pos_emb along sequence dimension
+            # and select the parition of the current CP rank
+            emb = get_pos_emb_on_this_cp_rank(emb, 0)
+        return emb
+
+        # # Core RoPE block
+        # inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        # position_ids_expanded = position_ids[:, None, :].float()
+        # # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        # device_type = x.device.type
+        # device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
         # with torch.autocast(device_type=device_type, enabled=False):
         #     freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
         #     emb = torch.cat((freqs, freqs), dim=-1)
@@ -134,10 +156,6 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
         # sin = sin * self.attention_scaling
 
         # return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
-
-        freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        return emb
 
 
 # Inverse dim formula to find dim based on number of rotations
@@ -174,4 +192,4 @@ def _linear_ramp_factor(min: float, max: float, dim: int) -> Tensor:
 def _get_mscale(scale: float = 1) -> float:
     if scale <= 1:
         return 1.0
-    return 0.1 * math.log(scale) + 1.0 #多了mscale,mscale默认值为1,取默认值时和yarn作者代码一样
+    return 0.1 * math.log(scale) + 1.0

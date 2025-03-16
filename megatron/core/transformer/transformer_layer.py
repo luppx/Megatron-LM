@@ -355,6 +355,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         inference_params=None,
         packed_seq_params=None,
         sequence_len_offset=None,
+        mscale: float = 1.0,
     ):
         """
         Perform a forward pass through the transformer layer.
@@ -372,6 +373,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             attention_bias (Tensor, optional): Bias tensor for Q * K.T.
             inference_params (object, optional): Parameters for inference-time optimizations.
             packed_seq_params (object, optional): Parameters for packed sequence processing.
+            mscale (float, optional): Scaling factor for attention. Used for Rotary embedding. Default is 1.0.
 
         Returns:
             Tuple[Tensor, Tensor]: A tuple containing:
@@ -397,6 +399,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            mscale=mscale,
         )
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself

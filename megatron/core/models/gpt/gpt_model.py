@@ -11,6 +11,7 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding_hf import YarnRotaryEmbeddingHF
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import ModelType
@@ -59,6 +60,13 @@ class GPTModel(LanguageModule):
         seq_len_interpolation_factor (Optional[float], optional):
             scale of linearly interpolating RoPE for longer sequences.
             The value must be a float larger than 1.0. Defaults to None.
+        attention_factor (float, optional): The scaling factor to be applied on the attention
+            computation. If unspecified, it defaults to value recommended by the implementation, using the
+            `factor` field to infer the suggested value.
+        beta_fast (float, optional): Parameter to set the boundary for extrapolation (only) in the linear
+            ramp function. Defaults to 32.
+        beta_slow (float, optional): Parameter to set the boundary for interpolation (only) in the linear
+            ramp function. Defaults to 1.
     """
 
     def __init__(
@@ -79,6 +87,11 @@ class GPTModel(LanguageModule):
         rope_scaling_factor: float = 8.0,
         scatter_embedding_sequence_parallel: bool = True,
         seq_len_interpolation_factor: Optional[float] = None,
+        # YaRN参数
+        partial_rotary_factor: float = 1.0,
+        attention_factor: float = None,
+        beta_fast: float = 32.0,
+        beta_slow: float = 1.0,
     ) -> None:
         super().__init__(config=config)
 
@@ -123,6 +136,21 @@ class GPTModel(LanguageModule):
                 rotary_base=rotary_base,
                 rope_scaling=rope_scaling,
                 rope_scaling_factor=rope_scaling_factor,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+            )
+        elif self.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbeddingHF(
+                kv_channels=self.config.kv_channels,
+                rope_theta=rotary_base,
+                partial_rotary_factor=partial_rotary_factor,
+                max_position_embeddings=self.max_position_embeddings,
+                factor=rope_scaling_factor,
+                attention_factor=attention_factor,
+                beta_fast=beta_fast,
+                beta_slow=beta_slow,
+                rotary_percent=rotary_percent,
+                rotary_interleaved=self.config.rotary_interleaved,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
                 use_cpu_initialization=self.config.use_cpu_initialization,
             )
 
@@ -231,7 +259,9 @@ class GPTModel(LanguageModule):
         rotary_pos_emb = None
         rotary_pos_cos = None
         rotary_pos_sin = None
-        if self.position_embedding_type == 'rope' and not self.config.multi_latent_attention:
+        mscale = 1.0
+        if (self.position_embedding_type == 'rope' and not self.config.multi_latent_attention) or \
+            (self.position_embedding_type == 'yarn'):
             if not self.training and self.config.flash_decode and inference_params:
                 # Flash decoding uses precomputed cos and sin for RoPE
                 rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
@@ -247,6 +277,8 @@ class GPTModel(LanguageModule):
                     packed_seq=packed_seq_params is not None
                     and packed_seq_params.qkv_format == 'thd',
                 )
+                if self.position_embedding_type == 'yarn':
+                    mscale = self.rotary_pos_emb.attention_factor
         if (
             (self.config.enable_cuda_graph or self.config.flash_decode)
             and rotary_pos_cos is not None
@@ -271,6 +303,7 @@ class GPTModel(LanguageModule):
             rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            mscale=mscale,
             **(extra_block_kwargs or {}),
         )
 

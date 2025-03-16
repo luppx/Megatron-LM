@@ -349,6 +349,7 @@ class Attention(MegatronModule, ABC):
         attention_bias=None,
         packed_seq_params=None,
         sequence_len_offset=None,
+        mscale: float =1.0,
     ):
         """
         Perform a forward pass through the attention module.
@@ -439,7 +440,7 @@ class Attention(MegatronModule, ABC):
             query = apply_rotary_pos_emb(
                 query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
             )
-            key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv)
+            key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv, mscale=mscale)
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
