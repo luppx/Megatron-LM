@@ -438,7 +438,7 @@ class Attention(MegatronModule, ABC):
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
             query = apply_rotary_pos_emb(
-                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q
+                query, q_pos_emb, config=self.config, cu_seqlens=cu_seqlens_q, mscale=mscale
             )
             key = apply_rotary_pos_emb(key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv, mscale=mscale)
 

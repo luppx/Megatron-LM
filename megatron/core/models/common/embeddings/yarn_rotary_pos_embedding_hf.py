@@ -80,7 +80,6 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
         self.inv_freq_extrapolation = 1.0 / pos_freqs
         self.inv_freq_interpolation = 1.0 / (self.factor * pos_freqs)
 
-        self.original_inv_freq = self.inv_freq
         self.attention_scaling = self.attention_factor
 
         super().__init__(
@@ -93,7 +92,7 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
         )
 
     @lru_cache(maxsize=32)
-    def forward(self, max_seq_len: int, offset: int = 0) -> Tensor:
+    def forward(self, max_seq_len: int, offset: int = 0, packed_seq: bool = False) -> Tensor:
         """Forward pass of Yarn Rotary Embedding.
 
         Args:
@@ -116,7 +115,7 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
 
         # Get n-dimensional rotational scaling corrected for extrapolation
         inv_freq_extrapolation_factor = 1 - _linear_ramp_factor(low, high, self.dim // 2).to(
-            device=self.inv_freq_extra.device, dtype=torch.float32
+            device=self.inv_freq_extrapolation.device, dtype=torch.float32
         )
         inv_freq = (
             self.inv_freq_interpolation * (1 - inv_freq_extrapolation_factor)
@@ -125,7 +124,7 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
 
         seq = (
             torch.arange(
-                max_seq_len, device=self.inv_freq_extra.device, dtype=self.inv_freq_extra.dtype
+                max_seq_len, device=self.inv_freq_extrapolation.device, dtype=self.inv_freq_extrapolation.dtype
             )
             + offset
         )
@@ -133,29 +132,11 @@ class YarnRotaryEmbeddingHF(RotaryEmbedding):
         freqs = torch.outer(seq, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         emb = emb[:, None, None, :]
-        if parallel_state.get_context_parallel_world_size() > 1:
+        if parallel_state.get_context_parallel_world_size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension
             # and select the parition of the current CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0)
         return emb
-
-        # # Core RoPE block
-        # inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
-        # position_ids_expanded = position_ids[:, None, :].float()
-        # # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
-        # device_type = x.device.type
-        # device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
-        # with torch.autocast(device_type=device_type, enabled=False):
-        #     freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
-        #     emb = torch.cat((freqs, freqs), dim=-1)
-        #     cos = emb.cos()
-        #     sin = emb.sin()
-
-        # # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
-        # cos = cos * self.attention_scaling
-        # sin = sin * self.attention_scaling
-
-        # return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 # Inverse dim formula to find dim based on number of rotations
