@@ -313,7 +313,7 @@ class TransformerBlock(MegatronModule):
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb, mscale
+                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -387,7 +387,7 @@ class TransformerBlock(MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb, mscale
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
                     )
         else:
             raise ValueError("Invalid activation recompute method.")
